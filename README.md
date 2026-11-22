@@ -60,22 +60,25 @@ Os tamanhos do lado socket são o `pickle` da mensagem. Os do XML-RPC são o XML
 - O servidor atende uma chamada por vez. O comparison precisa de fila (`max(N, 16)`) para os logs que chegam juntos.
 - Os dois lados continuam acoplados pelo nome dos métodos e pela porta em `constMP.py`. O que saiu foi o acordo implícito sobre as chaves do dicionário `op` e sobre o tamanho de cada `recv`.
 
-Very simple demo of multicast communication without coordination. The intent is to demonstrate how things can go wrong as we scale a distributed system (in this case, scaling in the geographical dimension) without taking appropriate measures to coordinate the behavior of its components. Later, this example will serve as the basis to implement coordination protocols, notably for message ordering, as part of course assignments.
+## Evidência com perda e atraso
+
+O sistema completo (XML-RPC no cliente-servidor, entrega confiável e FIFO no UDP) foi executado no Docker com `tc netem` só no UDP da porta 6789. Seis peers, duas rodadas de 20 mensagens, commit `13e0bc0`. A saída integral está em:
+
+- [`docs/evidencias/rpc-fifo-loss10.txt`](docs/evidencias/rpc-fifo-loss10.txt) — `NETEM="loss 10%"`
+- [`docs/evidencias/rpc-fifo-delay20-loss10.txt`](docs/evidencias/rpc-fifo-delay20-loss10.txt) — `NETEM="delay 20ms 10ms loss 10%"`
+
+Nos dois cenários o comparison saiu com código 0. Cada log tinha 120 mensagens, a checagem de FIFO passou nos seis peers nas duas rodadas, e `tests/check_logs.py` terminou com OK. Houve retransmissões, duplicatas descartadas e mensagens retidas na fila de espera, como esperado com perda. A métrica de ordem total acusou 117 a 120 rodadas fora de ordem; isso não é falha de FIFO. Não houve linha `ERROR` nem `WARNING`. O teste em nuvem não foi feito.
+
+Demo of multicast among peers. Client-server calls use XML-RPC. The UDP multicast is reliable and delivers each sender's messages in FIFO order. The comparison server still reports a total-order metric: with loss or delay, that count stays high even when FIFO holds. The runs above are the evidence.
 
 ## Overall structure
-A set of **peer processes** is established and each process multicasts a sequence of messages to all the others at random intervals. Messages are stamped with the ID of the sending process and a local sequence number defined by the sending process. This is a simple attempt to demonstrate the problem of message ordering (or, indeed, the lack of message ordering).
+A set of **peer processes** runs *peerCommunicatorUDP.py*. Each peer multicasts a sequence of messages at random intervals. Every message carries the sender id and a local sequence number. A long-lived thread receives UDP datagrams, acknowledges them and holds a message back until the earlier ones from that sender have been delivered. Another thread retransmits what has not been acknowledged. The main thread registers the peer, waits for the start signal, sends the round and submits the log.
 
-The peer processes run the *peerCommunicatorUDP.py* program, which has two separate threads, one for sending and the other for receiving messages. After starting, a peer processes waits for a signal (from a process that coordinates the experiment) in order to actually start multicasting the sequence of messages. Each peer collects all the received messages (in the order that they were received) and sends the list of messages to the coordinator process, which will compare the order of messages as received by all the peers (as described next).
+*comparisonServer.py* asks the group manager for the peer list, calls `start(peerNumber, nMsgs)` on each peer, then receives each log with `submitLog`. It checks two things: FIFO and completeness per sender, and the original total-order count (`unordered message rounds`).
 
-A separate process runs *comparisonServer.py*, which, besides coordinating the start of the peer processes (by sending the start signal mentioned above), waits for the list of received messages from each peer and compares their order. It reports a metric that indicates the occurrence of out-of-order messages (actually, the number of message exchange rounds in which at least one process received a different message form the others). Importantly, we assume that no messages are lost, and, in an ideal scenario, all processes should receive all the same messages in the same order. Note, however, that the current version does not use a reliable message communication protocol to ensure that messages are not lost (this can be an improvement to be implemented as an assignment).
+*GroupMngr.py* registers peers and lists them. `register` is idempotent per IP. `unregister` removes a peer. Both servers and the peers talk to each other through XML-RPC on the same ports as the old TCP sockets. Peer-to-peer traffic stays on UDP port 6789.
 
-A second server process, running *GroupMngr.py*, is used for peers to register themselves (notably their IP addresses) as well as to discover the other peers.
-
-In order to actually see the problem of message ordering, it is necessary to introduce variability on message communication latency, such as by running the peer processes on different networks, e.g., running some of the peers in one region of the cloud, whereas the others are run on another region. This illustrates the issue of geographic scalability, when the system works fine when all its components are in the same network, but starts to behave erroneously when its components are spread across the Internet.
+Loss and delay on that UDP port are simulated with `NETEM` (tc netem in Docker) or with `LOSS_RATE`, `DELAY_MS` and `JITTER_MS` (netsim.py). The local Docker run is the one used for the experiments. A cloud deployment is optional.
 
 ## Setup
-- Create one instance (virtual machine in the cloud) to run the two servers, and a number of instances (e.g., 6 in one cloud region, 2 on another) to run the peers.
-- Edit *constMP.py* with the correct IP address of the instance where the two servers will run. Tip: allocate a fixed IP address (elastic IP in AWS jargon) to the server instance. Also edit the file to configure the number of peers processes in the experiment.
-- On the server instance, run *GroupMngr.py*
-- On some of the peer instances: run *peerCommunicator.py*
-- Back on the server instance: run *comparisonServer.py*
+Local execution is the Docker section at the top. For a manual run, set `SERVER_ADDR`, `GROUPMNGR_ADDR` and `N_PEERS` (or edit the defaults in *constMP.py*), start *GroupMngr.py*, then one *peerCommunicatorUDP.py* per peer, then *comparisonServer.py*.
