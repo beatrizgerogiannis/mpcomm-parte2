@@ -3,13 +3,13 @@ from constMP import * #-
 import threading
 import random
 import time
-import pickle
 import os
 import traceback
 import xmlrpc.client
 from xmlrpc.server import SimpleXMLRPCServer
 from requests import get
 import netsim   # software-level network simulator (LOSS_RATE / DELAY_MS / JITTER_MS)
+import transport   # JSON encode/decode of the UDP messages
 
 from reliability import (RoundState, PendingSends, pending_key, make_ack, key_from_ack,
                          classify_round, should_give_up)
@@ -140,7 +140,7 @@ pendingCond = threading.Condition()
 
 # Send msg to addr and keep it pending until the ACK arrives (retransmitted by Retransmitter)
 def sendReliable(addr, msg):
-  msgPack = pickle.dumps(msg)
+  msgPack = transport.encode(msg)
   with pendingCond:
     # Registered before sending, so that a fast ACK always finds it
     pending.add(pending_key(addr, msg), msgPack, time.monotonic())
@@ -166,16 +166,14 @@ class MsgHandler(threading.Thread):
   def handleOne(self):
     msgPack, addr = self.sock.recvfrom(1024)
     try:
-      msg = pickle.loads(msgPack)
-    except Exception as e:
+      msg = transport.decode(msgPack)
+    except ValueError as e:
       print('Discarded invalid packet from ', addr, ': ', e)
       return
     if msg[0] == 'ACK':
       self.handleAck(msg, addr)
-    elif msg[0] in ('READY', 'DATA', 'END'):
+    else:   # READY, DATA or END (anything else is rejected by transport.decode)
       self.handleMessage(msg, addr)
-    else:
-      print('Discarded unknown message from ', addr, ': ', msg)
 
   def handleAck(self, msg, addr):
     # ('ACK', round, acker, ackedKind, sender, seq): the acker is the destination of the original
@@ -186,7 +184,8 @@ class MsgHandler(threading.Thread):
   def sendAck(self, msg, addr, myself):
     ack = make_ack(msg, myself)
     # ACKs go to the receive port of the sender (handled by its receiver thread)
-    sendSocket.sendto(pickle.dumps(ack), (addr[0], PEER_UDP_PORT))
+    # (sent directly, without netsim, as before: transport.send would also apply netsim to ACKs)
+    sendSocket.sendto(transport.encode(ack), (addr[0], PEER_UDP_PORT))
 
   def handleMessage(self, msg, addr):
     kind = msg[0]
@@ -353,7 +352,7 @@ while 1:
       # Wait some random time between successive messages
       time.sleep(random.randrange(10,100)/1000)
       for addrToSend in PEERS:
-        sendReliable(addrToSend, ('DATA', rnd.number, myself, msgNumber))
+        sendReliable(addrToSend, ('DATA', rnd.number, myself, msgNumber, {}))
         print('Sent message ' + str(msgNumber))
 
     # Tell all processes that I have no more messages to send (and how many I sent)
