@@ -387,6 +387,59 @@ das mensagens, ACK, regra de rodadas) não mudou; só foram extraídas funções
   (ex.: logs grandes) chegam truncadas e o `pickle.loads` falha. → Passo 3 (resolvido pelo RPC).
 - **Registro duplicado e ausência de `unregister` no GroupMngr:** um peer que reinicia é
   registrado de novo e peers que saem nunca são removidos. → Passo 3.
-- **`pickle` em rede é inseguro:** desserializar dados recebidos pela rede permite execução
-  de código arbitrário. Mantido por compatibilidade; apenas documentado.
+- ~~**`pickle` em rede é inseguro:** desserializar dados recebidos pela rede permite execução
+  de código arbitrário. Mantido por compatibilidade; apenas documentado.~~ → **Resolvido na
+  Parte 2 (#2)** (JSON via `transport.py`).
 
+## Parte 2 — #2 transport.py: JSON no lugar de pickle
+
+### O que era
+As mensagens UDP entre peers (`READY`, `DATA`, `END`, `ACK`) eram tuplas serializadas com
+`pickle.dumps` no envio (`sendReliable`, `sendAck`) e `pickle.loads` na recepção (`handleOne`).
+
+### Por que era problema
+- **Segurança:** `pickle.loads` sobre bytes vindos da rede executa código arbitrário; qualquer
+  um que alcance a porta UDP 6789 controlaria o peer.
+- **Formato implícito:** não havia validação. Uma tupla mal formada passava pelo `pickle` e só
+  falhava depois (`IndexError` etc.), dentro da lógica do protocolo.
+- **Parte 2:** o `DATA` vai carregar comandos da aplicação (dicts); é preciso um formato de
+  transporte explícito, legível e independente da linguagem.
+
+### O que mudou
+- **`transport.py` (novo, camada de transporte, sem lógica de confiabilidade):**
+  - `encode(msg)`: JSON compacto (`separators=(',', ':')`, `ensure_ascii=False`, UTF-8);
+    aceita tupla ou lista.
+  - `decode(data)`: devolve uma lista; para bytes que não são UTF-8, JSON inválido ou
+    mensagem mal formada lança **só** `ValueError`.
+  - `validate(msg)`: regras por tipo — `READY` 3 campos, `DATA` 5 (payload `dict`), `END` 4,
+    `ACK` 6 (`ackedKind` em `READY`/`DATA`/`END`); round, sender, seq, total e acker têm de
+    ser inteiros (`int` e não `bool`). Tipo desconhecido ou número de campos errado é recusado.
+  - `send(sock, msg, addr)`: `encode` + `netsim.send`.
+- **Formato do `DATA`:** ganhou a 5ª posição, `payload` (dict):
+  `("DATA", rodada, remetente, seq, payload)`. Nesta issue o peer envia `{}`. As posições 0–3
+  não mudaram, então `reliability.py` (`pending_key`, `make_ack`, `key_from_ack`, `ack_seq`)
+  funciona sem alteração (só o comentário de cabeçalho foi atualizado).
+- **Limite de 1024 bytes:** `MAX_DATAGRAM = 1024`, o mesmo tamanho do `recvfrom` do peer.
+  Mensagem codificada maior é recusada no envio (`ValueError`), em vez de chegar truncada e
+  ser descartada no receptor sem que o remetente saiba.
+- **`peerCommunicatorUDP.py`:**
+  - `sendReliable`: guarda em `PendingSends` os bytes de `transport.encode(msg)`; a
+    retransmissão continua reenviando os mesmos bytes via `netsim.send`.
+  - `handleOne`: `transport.decode`; em `ValueError` imprime
+    `Discarded invalid packet from <addr>: <motivo>` e retorna (a thread receptora segue).
+    O antigo `Discarded unknown message` foi removido: tipo desconhecido agora é recusado
+    pelo `decode`.
+  - `sendAck`: `sendSocket.sendto(transport.encode(ack), ...)`. O ACK continua sendo enviado
+    **direto**, sem passar pelo `netsim`, como antes (ver observação abaixo).
+  - `import pickle` removido.
+- **`tests/test_transport.py` (novo):** ida e volta dos 4 tipos, payload preservado, todos os
+  casos inválidos (UTF-8, JSON, não-lista, tipo, campos, string/bool/float em campo inteiro,
+  payload, `ackedKind`), limite de tamanho e integração com `reliability`
+  (`pending_key` do `DATA` = `key_from_ack` do ACK depois de passar pelo JSON).
+
+### Observação: ACK sem `netsim`
+`transport.send` passa pelo `netsim`; usá-lo no `sendAck` faria o `LOSS_RATE`/`DELAY_MS`
+passar a valer também para os ACKs, e o atraso (`time.sleep`) bloquearia a thread receptora
+a cada ACK. Para não alterar o comportamento do ACK nesta issue, o peer codifica com
+`transport.encode` e envia com `sendSocket.sendto`, como antes. O `NETEM` (tc) continua
+afetando ACKs normalmente, porque age na interface.

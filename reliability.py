@@ -1,9 +1,9 @@
 # Reliable delivery for the peer-to-peer UDP multicast (positive ACK + retransmission).
 # Pure logic, no sockets: used by peerCommunicatorUDP.py and tested in tests/test_reliability.py.
 #
-# UDP messages (pickled tuples):
+# UDP messages (JSON lists, encoded/decoded by transport.py; tuples on the sending side):
 #   ('READY', round, sender)
-#   ('DATA',  round, sender, seq)
+#   ('DATA',  round, sender, seq, payload)            # payload: dict (application command)
 #   ('END',   round, sender, total)
 #   ('ACK',   round, acker, ackedKind, sender, seq)   # seq = -1 for READY and END
 
